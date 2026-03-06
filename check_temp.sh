@@ -1,199 +1,98 @@
 #!/bin/bash
 
-################################################################################
-#                                                                              #
-#  Copyright (C) 2011 Jack-Benny Persson <jake@cyberinfo.se>                   #
-#                                                                              #
-#   This program is free software; you can redistribute it and/or modify       #
-#   it under the terms of the GNU General Public License as published by       #
-#   the Free Software Foundation; either version 2 of the License, or          #
-#   (at your option) any later version.                                        #
-#                                                                              #
-#   This program is distributed in the hope that it will be useful,            #
-#   but WITHOUT ANY WARRANTY; without even the implied warranty of             #
-#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the              #
-#   GNU General Public License for more details.                               #
-#                                                                              #
-#   You should have received a copy of the GNU General Public License          #
-#   along with this program; if not, write to the Free Software                #
-#   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA  #
-#                                                                              #
-################################################################################
+VERSION="Version 1.3 (Raspberry Pi aware)"
+AUTHOR="(c) 2011 Jack-Benny Persson, (c) 2020 Onkobu Tanaake, Pi adaptation"
+# Adapted for use on Raspberry Pi by Bill Mullen 2024
 
-###############################################################################
-#                                                                             #	
-# Nagios plugin to monitor CPU and M/B temperature with sensors.              #
-# Written in Bash (and uses sed & awk).                                       #
-# Latest version of check_temp can be found at the below URL:                 #
-# https://github.com/jackbenny/check_temp                                     #
-#                                                                             #
-# If you are having problems getting it to work, check the instructions in    #
-# the README first. It walks you though install lm-sensors and getting it to  #
-# display sensor data.                                                        #
-#                                                                             #
-###############################################################################
-
-VERSION="Version 1.2"
-AUTHOR="(c) 2011 Jack-Benny Persson (jack-benny@cyberinfo.se), (c) 2020 Onkobu Tanaake (oss@onkobutanaake.de)"
-
-# Sensor program
-SENSORPROG=$(whereis -b -B /{bin,sbin,usr} /{bin,sbin,usr}/* -f sensors | awk '{print $2}')
-
-# Ryan's note: utils.sh is installed with nagios-plugins in with the plugins
-# Check if utils.sh exists. This lets you use check_domain in a testing environment
-# or outside of Nagios.
-if [ -e "$PROGPATH/utils.sh" ]; then
-	. "$PROGPATH/utils.sh"
-else
-	STATE_OK=0
-	STATE_WARNING=1
-	STATE_CRITICAL=2
-	STATE_UNKNOWN=3
-#	STATE_DEPENDENT=4    (Commented because it's unused.)
-fi
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
 
 shopt -s extglob
 
+#### Detect Raspberry Pi ####
+
+IS_RPI=0
+
+if [[ -f /proc/device-tree/model ]]; then
+    if grep -qi "raspberry pi" /proc/device-tree/model; then
+        IS_RPI=1
+    fi
+fi
+
+#### Locate sensors binary if available ####
+
+SENSORPROG=$(command -v sensors 2>/dev/null)
+
 #### Functions ####
 
-# Print version information
-print_version()
-{
-	echo "$0 - $VERSION"
+print_version() {
+    echo "$0 - $VERSION"
 }
 
-#Print help information
-print_help()
-{
-	print_version
-	echo "$AUTHOR"
-	echo "Monitor temperature with the use of sensors"
-/bin/cat <<EOT
+print_help() {
+    print_version
+    echo "$AUTHOR"
+    echo "Monitor temperature (Raspberry Pi aware)"
+cat <<EOT
 
 Options:
 -h, --help
-   Print detailed help screen
+   Print detailed help
 -V, --version
-   Print version information
+   Print version
 -v, --verbose
    Verbose output
 
--s, --sensor <WORD[,DISPLAY_NAME]>
-   Set what to monitor, for example CPU or MB (or M/B). Check sensors for the
-   correct word. Default is CPU. A different display name can be used in output,
-   by adding it next to sensor with a comma.
-   It can be used more than once, with different warning/critical thresholds optionally.
+-s, --sensor <WORD>
+   Sensor to monitor (CPU, GPU, or lm-sensors name)
+
 -w, --warning <INTEGER>
-   Exit with WARNING status if above INTEGER degrees
+   Warning threshold
+
 -c, --critical <INTEGER>
-   Exit with CRITICAL status if above INTEGER degrees
-   Warning and critical thresholds must be provided before the corresponding --sensor option.
--n
-   Use the new sed based filter in case classic filter yields no temperature.
+   Critical threshold
 
 Examples:
-./check_temp.sh [-n] -w 65 -c 75 --sensor CPU
-./check_temp.sh [-n] -w 65 -c 75 --sensor CPU --sensor temp1
-./check_temp.sh [-n] -w 65 -c 75 --sensor CPU -w 75 -c 85 --sensor temp1,GPU
+./check_temp.sh -w 65 -c 75 --sensor CPU
+./check_temp.sh -w 70 -c 85 --sensor GPU
+./check_temp.sh -w 60 -c 75 --sensor temp1
+
 EOT
 }
 
+get_pi_cpu_temp() {
+    if [[ -f /sys/class/thermal/thermal_zone0/temp ]]; then
+        awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp
+    fi
+}
 
-###### MAIN ########
+get_pi_gpu_temp() {
+    if command -v vcgencmd >/dev/null 2>&1; then
+        vcgencmd measure_temp | awk -F"[=']" '{print $2}'
+    fi
+}
 
-# Warning threshold
+get_lmsensors_temp() {
+
+    if [[ -z "$SENSORPROG" ]]; then
+        return
+    fi
+
+    WHOLE_TEMP=$(${SENSORPROG} | grep "$sensor" | head -n1 | \
+        grep -o "+[0-9]\+\(\.[0-9]\+\)\?[^ \t,()]*" | head -n1)
+
+    echo "$WHOLE_TEMP" | grep -o "[0-9]\+\(\.[0-9]\+\)\?"
+}
+
+#### MAIN ####
+
 thresh_warn=
-# Critical threshold
 thresh_crit=
-# Hardware to monitor
-default_sensor="CPU"
-sensor_declared=false
+sensor="CPU"
 
-STATE=$STATE_OK
-
-# See if we have sensors program installed and can execute it
-if [[ ! -x "$SENSORPROG" ]]; then
-	echo "It appears you don't have lm-sensors installed. You may find help in the readme for this script."
-	exit $STATE_UNKNOWN
-fi
-
-function set_state {
-	[[ "$STATE" -lt "$1" ]] && STATE=$1 
-}
-
-function process_sensor {
-	sensor=$(echo $1 | cut -d, -f1)
-	sensor_display=$(echo $1 | cut -d, -f2)
-	# Check if a sensor were specified
-	if [[ -z "$sensor" ]]; then
-		# No sensor to monitor were specified
-		echo "No sensor specified"
-		print_help
-		exit $STATE_UNKNOWN
-	fi
-
-	# Check if the thresholds have been set correctly
-	if [[ -z "$thresh_warn" || -z "$thresh_crit" ]]; then
-		# One or both thresholds were not specified
-		echo "Threshold not set"
-		print_help
-		exit $STATE_UNKNOWN
-	  elif [[ "$thresh_crit" -lt "$thresh_warn" ]]; then
-		# The warning threshold must be lower than the critical threshold
-		echo "Warning temperature should be lower than critical"
-		print_help
-		exit $STATE_UNKNOWN
-	fi
-	# Get the temperature
-	# Grep the first float with a plus sign and keep only the integer
-	if [ $CLASSIC_FILTER -eq 1 ]; then
-		WHOLE_TEMP=$(${SENSORPROG} | grep "$sensor" | head -n1 | grep -o "+[0-9]\+\(\.[0-9]\+\)\?[^ \t,()]*" | head -n1)
-	else
-		WHOLE_TEMP=$(${SENSORPROG} -A "$sensor" | sed -n '2 p' | grep -o "+[0-9]\+\(\.[0-9]\+\)\?[^ \t,()]*" | head -n1)
-	fi
-	TEMPF=$(echo "$WHOLE_TEMP" | grep -o "[0-9]\+\(\.[0-9]\+\)\?")
-	TEMP=$(echo "$TEMPF" | cut -d. -f1)
-
-	# Verbose output
-	if [[ "$verbosity" -ge 1 ]]; then
-	   /bin/cat <<__EOT
-	Debugging information:
-	  Warning threshold: $thresh_warn 
-	  Critical threshold: $thresh_crit
-	  Verbosity level: $verbosity
-	  Current $sensor temperature: $TEMP
-__EOT
-	echo "Temperature lines directly from sensors:"
-	${SENSORPROG}
-	fi
-	
-	# Get performance data for Nagios "Performance Data" field
-	PERFDATA="$PERFDATA $sensor_display=$TEMP;$thresh_warn;$thresh_crit"
-
-	# And finally check the temperature against our thresholds
-	if [[ "$TEMP" != +([0-9]) ]]; then
-		# Temperature not found for that sensor
-		OUTPUT_TEXT="$OUTPUT_TEXT, No data found for sensor ($sensor)"
-		set_state $STATE_UNKNOWN
-	elif [[ "$TEMP" -gt "$thresh_crit" ]]; then
-		# Temperature is above critical threshold
-		OUTPUT_TEXT="$OUTPUT_TEXT, $sensor_display has temperature: $WHOLE_TEMP"
-		set_state $STATE_CRITICAL
-	elif [[ "$TEMP" -gt "$thresh_warn" ]]; then
-		# Temperature is above warning threshold
-		OUTPUT_TEXT="$OUTPUT_TEXT, $sensor_display has temperature: $WHOLE_TEMP"
-		set_state $STATE_WARNING
-	else
-		# Temperature is ok
-		OUTPUT_TEXT="$OUTPUT_TEXT, $sensor_display has temperature: $WHOLE_TEMP"
-		set_state $STATE_OK
-	fi
-}
-
-CLASSIC_FILTER=1
-
-# Parse command line options
-while [[ -n "$1" ]]; do 
+while [[ -n "$1" ]]; do
    case "$1" in
 
        -h | --help)
@@ -212,84 +111,88 @@ while [[ -n "$1" ]]; do
            ;;
 
        -w | --warning)
-           if [[ -z "$2" ]]; then
-               # Threshold not provided
-               echo "Option $1 requires an argument"
-               print_help
-               exit $STATE_UNKNOWN
-            elif [[ "$2" = +([0-9]) ]]; then
-               # Threshold is an integer 
-               thresh=$2
-            else
-               # Threshold is not an integer
-               echo "Threshold must be an integer"
-               print_help
-               exit $STATE_UNKNOWN
-           fi
-           thresh_warn=$thresh
-	   shift 2
-           ;;
-
-       -c | --critical)
-           if [[ -z "$2" ]]; then
-               # Threshold not provided
-               echo "Option '$1' requires an argument"
-               print_help
-               exit $STATE_UNKNOWN
-            elif [[ "$2" = +([0-9]) ]]; then
-               # Threshold is an integer 
-               thresh=$2
-            else
-               # Threshold is not an integer
-               echo "Threshold must be an integer"
-               print_help
-               exit $STATE_UNKNOWN
-           fi
-           thresh_crit=$thresh
-	   shift 2
-           ;;
-
-       -s | --sensor)
-	   if [[ -z "$2" ]]; then
-		echo "Option $1 requires an argument"
-		print_help
-		exit $STATE_UNKNOWN
-	   fi
-	   sensor_declared=true
-	   sensors_to_check="$2"
+           thresh_warn=$2
            shift 2
            ;;
 
-	   -n | --new-filter)
-		   CLASSIC_FILTER=0
-		   shift 1
-		   ;;
+       -c | --critical)
+           thresh_crit=$2
+           shift 2
+           ;;
+
+       -s | --sensor)
+           sensor=$2
+           shift 2
+           ;;
+
        *)
-           echo "Invalid option '$1'"
+           echo "Invalid option $1"
            print_help
            exit $STATE_UNKNOWN
            ;;
    esac
-
-   # argument order is irrelevant, Icinga2 gives no guarantees
-   # as soon as there are enough output is generated
-   if [ ! -z "$thresh_warn" ] && [ ! -z "$thresh_crit" ] && [ ! -z "$sensors_to_check" -o $# -eq 0 ]; then
-	if [ "$sensor_declared" = false ]; then
-		process_sensor "$default_sensor"
-	else
-		process_sensor "$sensors_to_check"
-	fi
-   fi
 done
 
+if [[ -z "$thresh_warn" || -z "$thresh_crit" ]]; then
+    echo "Thresholds not set"
+    exit $STATE_UNKNOWN
+fi
 
-case "$STATE" in
-	"$STATE_OK") STATE_TEXT="OK" ;;
-	"$STATE_WARNING") STATE_TEXT="WARNING" ;;
-	"$STATE_CRITICAL") STATE_TEXT="CRITICAL" ;;
-	"$STATE_UNKNOWN") STATE_TEXT="UNKNOWN" ;;
+#### Get temperature ####
+
+case "$sensor" in
+
+    cpu|CPU)
+        if [[ $IS_RPI -eq 1 ]]; then
+            TEMP=$(get_pi_cpu_temp)
+        else
+            TEMP=$(get_lmsensors_temp)
+        fi
+        DISPLAY="CPU"
+        ;;
+
+    gpu|GPU)
+        if [[ $IS_RPI -eq 1 ]]; then
+            TEMP=$(get_pi_gpu_temp)
+        else
+            TEMP=$(get_lmsensors_temp)
+        fi
+        DISPLAY="GPU"
+        ;;
+
+    *)
+        TEMP=$(get_lmsensors_temp)
+        DISPLAY="$sensor"
+        ;;
 esac
 
-OUTPUT_TEXT=$(echo $OUTPUT_TEXT | sed -e 's/, //')
-echo "TEMPERATURE $STATE_TEXT - $OUTPUT_TEXT |$PERFDATA"
-exit $STATE
+#### Validate ####
+
+if ! [[ "$TEMP" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "TEMPERATURE UNKNOWN - No data for sensor $sensor"
+    exit $STATE_UNKNOWN
+fi
+
+TEMP_INT=$(echo "$TEMP" | cut -d. -f1)
+
+if [[ "$verbosity" -ge 1 ]]; then
+    echo "Debug:"
+    echo "  Raspberry Pi detected: $IS_RPI"
+    echo "  Sensor: $sensor"
+    echo "  Temperature: $TEMP"
+fi
+
+#### Threshold checks ####
+
+if (( $(echo "$TEMP > $thresh_crit" | bc -l) )); then
+    echo "TEMPERATURE CRITICAL - $DISPLAY temperature $TEMP°C | ${DISPLAY}=${TEMP};${thresh_warn};${thresh_crit}"
+    exit $STATE_CRITICAL
+
+elif (( $(echo "$TEMP > $thresh_warn" | bc -l) )); then
+    echo "TEMPERATURE WARNING - $DISPLAY temperature $TEMP°C | ${DISPLAY}=${TEMP};${thresh_warn};${thresh_crit}"
+    exit $STATE_WARNING
+
+else
+    echo "TEMPERATURE OK - $DISPLAY temperature $TEMP°C | ${DISPLAY}=${TEMP};${thresh_warn};${thresh_crit}"
+    exit $STATE_OK
+fi
